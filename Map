@@ -1,0 +1,1043 @@
+(async () => {
+
+  console.log("DMI: старт");
+
+  const ApplicationV1 = foundry.appv1?.api?.Application ?? globalThis.Application;
+  if (!ApplicationV1) { ui.notifications.error("Application не найден."); return; }
+  if (!game.user.isGM) { ui.notifications.warn("Только GM."); return; }
+
+  const FilePickerImpl =
+    foundry.applications?.apps?.FilePicker?.implementation ??
+    foundry.applications?.apps?.FilePicker ??
+    globalThis.FilePicker;
+  if (!FilePickerImpl) { ui.notifications.error("FilePicker не найден."); return; }
+
+
+  const CONFIG_KEY = "dnd-map-importer";
+  const UNZIP_BASE = "assets";
+  const DEFAULT_SUBFOLDER = "DND Maps";
+  const RENDER_THROTTLE_MS = 120;
+
+  const IMAGE_EXT = new Set([".png", ".jpg", ".jpeg", ".webp"]);
+  const IMAGE_MIME = {
+    ".png": "image/png", ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg", ".webp": "image/webp"
+  };
+  const LEGACY_PREFIXES = ["DND Maps - ", "Карты - "];
+
+  const DEFAULT_OPTIONS = {
+    source: "data",
+    root: "assets/DND Maps",
+    createRootFolder: false,
+    recursive: true,
+    gridSize: 100,
+    gridDistance: 5,
+    gridUnits: "ft",
+    activateAfterImport: false,
+    skipDuplicates: true
+  };
+
+
+  class DNDMapImporterApp extends ApplicationV1 {
+
+    static get defaultOptions() {
+      return foundry.utils.mergeObject(super.defaultOptions, {
+        id: "dnd-map-importer",
+        title: "Импортёр D&D карт",
+        width: 620, height: "auto", resizable: false,
+        classes: ["dnd-map-importer"]
+      });
+    }
+
+    constructor(options = {}) {
+      super(options);
+      this.optionsState = loadOptions();
+      this.busy = false;
+      this.screen = "home";
+      this.deletePlan = null;
+      this._lastRender = 0;
+      this.status = {
+        tone: "idle", title: "Импорт карт",
+        detail: "Выбери ZIP с картами или укажи папку с изображениями.",
+        progress: null, summary: null, rows: []
+      };
+    }
+
+    async getData() { return {}; }
+
+    async _renderInner() {
+      const $w = $(`<div class="dmi-root"></div>`);
+      $w.html(this._buildTemplate());
+      return $w;
+    }
+
+    activateListeners(html) {
+      super.activateListeners(html);
+      html.on("click", "[data-action]", this._onAction.bind(this));
+    }
+
+    async _onAction(ev) {
+      ev.preventDefault(); ev.stopPropagation();
+      if (this.busy) return;
+      const action = ev.currentTarget?.dataset?.action;
+      switch (action) {
+        case "pickZip":       return this.pickAndExtractZip();
+        case "openImporter":  return this._openSetup();
+        case "browse":        return this.browseFolder();
+        case "preview":       return this.runPreview();
+        case "import":        return this.runImport();
+        case "prepareDelete": return this.prepareDelete();
+        case "confirmDelete": return this.confirmDelete();
+        case "clearDelete":   return this._clearDelete();
+      }
+    }
+
+    _openSetup() {
+      this.screen = "setup";
+      this.status = {
+        tone: "idle", title: "Готово к проверке",
+        detail: "Выбери папку с картами и нажми «Проверить».",
+        progress: null, summary: null, rows: []
+      };
+      this._refresh();
+    }
+
+    _clearDelete() { this.deletePlan = null; this._refresh(); }
+
+    _refresh() {
+      if (!this.element) return;
+      const $root = this.element.find(".dmi-root");
+      if ($root.length) {
+        $root.html(this._buildTemplate());
+        this.activateListeners(this.element);
+      } else {
+        this.render(false);
+      }
+    }
+
+    _updateStatusBlock() {
+      const $s = this.element?.find(".dmi-status");
+      if ($s?.length) $s.replaceWith(this._statusBlock());
+      else this._refresh();
+    }
+
+    async beginBusy(title = "Работаю...") {
+      this.busy = true;
+      this.status = { tone: "busy", title, detail: "", progress: null,
+                      summary: this.status.summary, rows: this.status.rows };
+      this._lastRender = Date.now();
+      this._refresh();
+    }
+
+    async endBusy() { this.busy = false; this._refresh(); }
+
+    setStatus(tone, title, detail, progress = null,
+              { summary, rows, force = false } = {}) {
+      this.status = {
+        tone, title, detail, progress,
+        summary: summary ?? this.status.summary,
+        rows: rows ?? this.status.rows
+      };
+      const now = Date.now();
+      if (!force && now - this._lastRender < RENDER_THROTTLE_MS) return;
+      this._lastRender = now;
+      this._updateStatusBlock();
+    }
+
+ 
+
+    _buildTemplate() {
+      return `<style>${this._styles()}</style>` +
+             (this.screen === "home" ? this._homeScreen() : this._setupScreen());
+    }
+
+    _styles() {
+      return `
+        .dnd-map-importer .dmi-root { display: grid; gap: 10px; padding: 4px; }
+        .dnd-map-importer .dmi-home { display: grid; gap: 10px; }
+        .dnd-map-importer .dmi-home-btn {
+          display: grid; grid-template-columns: 45px 1fr; gap: 10px;
+          align-items: center; padding: 13px; text-align: left;
+          min-height: 70px; cursor: pointer;
+        }
+        .dnd-map-importer .dmi-home-btn i { font-size: 28px; text-align: center; }
+        .dnd-map-importer .dmi-home-btn strong { display: block; font-size: 14px; }
+        .dnd-map-importer .dmi-home-btn span {
+          display: block; font-size: 11px; opacity: .75; margin-top: 3px;
+        }
+        .dnd-map-importer .dmi-grid {
+          display: grid; grid-template-columns: 155px 1fr;
+          gap: 8px 10px; align-items: center;
+        }
+        .dnd-map-importer .dmi-path {
+          display: grid; grid-template-columns: 1fr 35px; gap: 6px;
+        }
+        .dnd-map-importer input[type="number"] { width: 100px; }
+        .dnd-map-importer .dmi-checks {
+          display: grid; grid-template-columns: 1fr 1fr;
+          gap: 7px; font-size: 12px;
+        }
+        .dnd-map-importer .dmi-checks label {
+          display: flex; align-items: center; gap: 6px; cursor: pointer;
+        }
+        .dnd-map-importer .dmi-actions {
+          display: flex; gap: 6px; justify-content: flex-end; align-items: center;
+        }
+        .dnd-map-importer .dmi-danger { margin-right: auto; }
+        .dnd-map-importer .dmi-status {
+          border: 1px solid var(--color-border-light-tertiary, #999);
+          border-radius: 5px; padding: 9px;
+          display: grid; gap: 7px; background: rgba(0,0,0,.08);
+        }
+        .dnd-map-importer .dmi-status-title {
+          display: flex; align-items: center; gap: 7px; font-weight: 600;
+        }
+        .dnd-map-importer .dmi-status-detail { font-size: 12px; opacity: .88; }
+        .dnd-map-importer .dmi-progress {
+          height: 7px; border-radius: 5px;
+          background: rgba(255,255,255,.12); overflow: hidden;
+        }
+        .dnd-map-importer .dmi-progress > div {
+          height: 100%; background: var(--color-level-info, #4a90e2);
+          transition: width .2s ease;
+        }
+        .dnd-map-importer .dmi-summary {
+          display: grid; grid-template-columns: repeat(4, 1fr); gap: 5px;
+        }
+        .dnd-map-importer .dmi-pill {
+          border: 1px solid var(--color-border-light-tertiary, #999);
+          border-radius: 4px; padding: 5px; text-align: center;
+        }
+        .dnd-map-importer .dmi-pill strong { display: block; font-size: 16px; }
+        .dnd-map-importer .dmi-pill span { font-size: 10px; opacity: .75; }
+        .dnd-map-importer .dmi-rows {
+          max-height: 200px; overflow: auto; font-size: 11px;
+        }
+        .dnd-map-importer .dmi-row {
+          display: grid; grid-template-columns: 1fr auto; gap: 8px; padding: 3px 0;
+        }
+        .dnd-map-importer .dmi-row .path {
+          overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+        }
+        .dnd-map-importer .dmi-delete {
+          border: 1px solid var(--color-border-highlight, #e08600);
+          border-radius: 4px; padding: 9px; display: grid; gap: 7px;
+        }
+        .dnd-map-importer .dmi-delete-buttons {
+          display: flex; gap: 6px; justify-content: flex-end;
+        }
+      `;
+    }
+
+    _homeScreen() {
+      const d = this.busy ? "disabled" : "";
+      return `
+        <div class="dmi-home">
+          <button type="button" class="dmi-home-btn" data-action="pickZip" ${d}>
+            <i class="fa-solid fa-file-zipper"></i>
+            <div>
+              <strong>Импортировать ZIP с картами</strong>
+              <span>Распакует в Data/${UNZIP_BASE}/&lt;имя архива&gt;/ и создаст папки и Scenes.</span>
+            </div>
+          </button>
+          <button type="button" class="dmi-home-btn" data-action="openImporter" ${d}>
+            <i class="fa-solid fa-map"></i>
+            <div>
+              <strong>Импортировать карты из папки</strong>
+              <span>Если изображения уже лежат в Data.</span>
+            </div>
+          </button>
+          ${this._statusBlock()}
+        </div>
+      `;
+    }
+
+    _setupScreen() {
+      const o = this.optionsState;
+      const d = this.busy ? "disabled" : "";
+      const sources = getAvailableSources()
+        .map(s => `<option value="${s}" ${s === o.source ? "selected" : ""}>${sourceLabel(s)}</option>`)
+        .join("");
+      return `
+        <form class="dmi" onsubmit="return false;">
+          <div class="dmi-grid">
+            <label>Хранилище</label>
+            <select name="source" ${d}>${sources}</select>
+            <label>Папка с картами</label>
+            <div class="dmi-path">
+              <input type="text" name="root" value="${escapeHtml(o.root)}" ${d} />
+              <button type="button" data-action="browse" ${d}><i class="fas fa-folder-open"></i></button>
+            </div>
+            <label>Размер клетки</label>
+            <input type="number" name="gridSize" min="1" max="1000" value="${Number(o.gridSize)}" ${d} />
+            <label>Футов на клетку</label>
+            <input type="number" name="gridDistance" min="0" step="0.5" value="${Number(o.gridDistance)}" ${d} />
+            <label>Единицы</label>
+            <select name="gridUnits" ${d}>
+              <option value="ft" ${o.gridUnits === "ft" ? "selected" : ""}>ft</option>
+              <option value="m"  ${o.gridUnits === "m" ? "selected" : ""}>m</option>
+              <option value="mi" ${o.gridUnits === "mi" ? "selected" : ""}>mi</option>
+            </select>
+          </div>
+          <div class="dmi-checks">
+            <label><input type="checkbox" name="createRootFolder" ${o.createRootFolder ? "checked" : ""} ${d} /> Создавать корневую папку</label>
+            <label><input type="checkbox" name="recursive" ${o.recursive ? "checked" : ""} ${d} /> Обрабатывать подпапки</label>
+            <label><input type="checkbox" name="skipDuplicates" ${o.skipDuplicates ? "checked" : ""} ${d} /> Пропускать дубликаты</label>
+            <label><input type="checkbox" name="activateAfterImport" ${o.activateAfterImport ? "checked" : ""} ${d} /> Активировать последнюю карту</label>
+          </div>
+          ${this._statusBlock()}
+          ${this.deletePlan ? this._deleteBlock() : ""}
+          <div class="dmi-actions">
+            <button type="button" class="dmi-danger" data-action="prepareDelete" ${d}>
+              <i class="fas fa-trash"></i> Удалить импорт
+            </button>
+            <button type="button" data-action="preview" ${d}>
+              <i class="fas fa-search"></i> Проверить
+            </button>
+            <button type="button" data-action="import" ${d}>
+              <i class="fas fa-file-import"></i> Импортировать
+            </button>
+          </div>
+        </form>
+      `;
+    }
+
+    _statusBlock() {
+      const icon =
+        this.busy ? "fa-solid fa-spinner fa-spin" :
+        this.status.tone === "error" ? "fa-solid fa-triangle-exclamation" :
+        this.status.tone === "done" ? "fa-solid fa-circle-check" :
+        "fa-solid fa-circle-info";
+      const progress = typeof this.status.progress === "number"
+        ? `<div class="dmi-progress"><div style="width:${clamp(this.status.progress, 0, 100)}%"></div></div>` : "";
+      const summary = this.status.summary ? `
+        <div class="dmi-summary">
+          <div class="dmi-pill"><strong>${this.status.summary.folders}</strong><span>папок</span></div>
+          <div class="dmi-pill"><strong>${this.status.summary.scenes}</strong><span>Scenes</span></div>
+          <div class="dmi-pill"><strong>${this.status.summary.images}</strong><span>карт</span></div>
+          <div class="dmi-pill"><strong>${this.status.summary.duplicates}</strong><span>дублей</span></div>
+        </div>` : "";
+      const rows = this.status.rows?.length ? `
+        <div class="dmi-rows">
+          ${this.status.rows.slice(0, 30).map(r => `
+            <div class="dmi-row">
+              <span class="path" title="${escapeHtml(r.path)}">${escapeHtml(r.path)}</span>
+              <span>${r.width}×${r.height}</span>
+            </div>`).join("")}
+        </div>` : "";
+      return `
+        <section class="dmi-status">
+          <div class="dmi-status-title"><i class="${icon}"></i><span>${escapeHtml(this.status.title)}</span></div>
+          <div class="dmi-status-detail">${escapeHtml(this.status.detail)}</div>
+          ${progress}${summary}${rows}
+        </section>
+      `;
+    }
+
+    _deleteBlock() {
+      const p = this.deletePlan;
+      return `
+        <section class="dmi-delete">
+          <strong>Удалить импортированные карты?</strong>
+          <div class="dmi-status-detail">
+            Scenes: ${p.scenes.length}, папок: ${p.folders.length}.
+            Изображения на диске останутся.
+          </div>
+          <div class="dmi-delete-buttons">
+            <button type="button" data-action="clearDelete"><i class="fas fa-times"></i> Отмена</button>
+            <button type="button" data-action="confirmDelete"><i class="fas fa-trash"></i> Удалить</button>
+          </div>
+        </section>
+      `;
+    }
+
+    readOptions() {
+      const form = this.element?.find("form")?.[0];
+      if (!form) return this.optionsState;
+      const get = n => form.querySelector(`[name='${n}']`);
+      return {
+        source: String(get("source")?.value || "data"),
+        root: normalizePath(get("root")?.value),
+        createRootFolder: Boolean(get("createRootFolder")?.checked),
+        recursive: Boolean(get("recursive")?.checked),
+        skipDuplicates: Boolean(get("skipDuplicates")?.checked),
+        activateAfterImport: Boolean(get("activateAfterImport")?.checked),
+        gridSize: clamp(Number(get("gridSize")?.value), 1, 1000),
+        gridDistance: Math.max(0, Number(get("gridDistance")?.value) || 5),
+        gridUnits: String(get("gridUnits")?.value || "ft")
+      };
+    }
+
+    async saveCurrentOptions() {
+      this.optionsState = this.readOptions();
+      await game.user.setFlag("world", CONFIG_KEY, this.optionsState);
+    }
+
+    async pickAndExtractZip() {
+      const picked = await pickLocalFile(".zip,application/zip");
+      if (!picked) return;
+      if (!picked.buffer) {
+        ui.notifications.error("Не удалось прочитать ZIP. Попробуй ещё раз.");
+        return;
+      }
+      const buffer = picked.buffer;
+      const fileName = picked.name;
+      await this.beginBusy(`Читаю архив «${fileName}»...`);
+      try {
+        const entries = readZipEntries(buffer);
+        const imageEntries = entries.filter(e =>
+          !e.isDirectory && isImagePath(e.name) &&
+          !/(^|\/)__MACOSX\//.test(e.name) &&
+          !/(^|\/)\.[^/]*$/.test(e.name)
+        );
+        if (!imageEntries.length) {
+          this.setStatus("error", "Карты не найдены",
+            `В «${fileName}» нет PNG, JPG, JPEG или WEBP.`, null, { force: true });
+          return;
+        }
+        const topLevels = new Set(imageEntries.map(e => e.name.split("/")[0]));
+        const hasCommonRoot = topLevels.size === 1 && imageEntries.every(e => e.name.includes("/"));
+        const zipFolderName = sanitizeFsName(stripExtension(fileName)) || "DND Maps";
+        const finalRoot = hasCommonRoot
+          ? `${UNZIP_BASE}/${sanitizeFsName([...topLevels][0])}`
+          : `${UNZIP_BASE}/${zipFolderName}`;
+        const prefix = hasCommonRoot ? "" : `${zipFolderName}/`;
+        const createdDirs = new Set();
+        const source = this.optionsState.source || "data";
+
+        let uploaded = 0;
+        for (const entry of imageEntries) {
+          const relative = `${prefix}${entry.name}`;
+          const segments = relative.split("/").map(sanitizeFsName).filter(Boolean);
+          const fn = segments.pop();
+          const dirPath = [UNZIP_BASE, ...segments].join("/");
+          await ensureDirectory(source, dirPath, createdDirs);
+          const bytes = await extractZipEntry(buffer, entry);
+          const ext = fn.toLowerCase().match(/\.[^.]+$/)?.[0] ?? "";
+          const uploadFile = new File([bytes], fn,
+            { type: IMAGE_MIME[ext] ?? "application/octet-stream" });
+          await FilePickerImpl.upload(source, dirPath, uploadFile, {}, { notify: false });
+          uploaded++;
+          this.setStatus("busy", "Распаковываю карты...",
+            `Загружено: ${uploaded}/${imageEntries.length}. Папка: ${finalRoot}`,
+            Math.round(uploaded / imageEntries.length * 100));
+          if (uploaded % 25 === 0) await sleep(0);
+        }
+        this.optionsState = { ...this.optionsState, source, root: normalizePath(finalRoot) };
+        await game.user.setFlag("world", CONFIG_KEY, this.optionsState);
+        this.screen = "setup";
+        this.status = {
+          tone: "done", title: "ZIP распакован",
+          detail: `Загружено карт: ${uploaded}. Путь: ${finalRoot}. Нажми «Проверить» или «Импортировать».`,
+          progress: 100, summary: null, rows: []
+        };
+        ui.notifications.info(`Загружено карт: ${uploaded}. Папка: ${finalRoot}`);
+        this._refresh();
+        refreshScenesSidebar();
+      } catch (err) {
+        console.error("DMI: ошибка распаковки", err);
+        this.setStatus("error", "Ошибка распаковки",
+          err?.message || String(err), null, { force: true });
+      } finally {
+        await this.endBusy();
+      }
+    }
+
+    async runPreview() { await this.saveCurrentOptions(); await this.runImportFlow(true); }
+    async runImport()  { await this.saveCurrentOptions(); await this.runImportFlow(false); }
+
+    async runImportFlow(previewOnly) {
+      await this.beginBusy(previewOnly ? "Проверяю карты..." : "Импортирую карты...");
+      try {
+        const o = this.optionsState;
+        const rootCheck = await safeBrowse(o.source, o.root);
+        if (!rootCheck.ok) {
+          this.setStatus("error", "Папка недоступна",
+            `Не могу открыть ${o.source}:${o.root}`, null, { force: true });
+          return;
+        }
+        const scan = await collectImageFiles(o, progress => {
+          this.setStatus("busy", "Сканирую карты...",
+            `Папок: ${progress.dirs}; карт: ${progress.files}`);
+        });
+        if (!scan.files.length) {
+          this.setStatus("error", "Карты не найдены",
+            `В ${o.source}:${o.root} нет изображений.`, null, { force: true });
+          return;
+        }
+        const plan = await buildImportPlan(o, scan.files);
+        const summary = summarizePlan(plan);
+        const previewRows = plan.map(e => ({ path: e.targetPath, width: e.width, height: e.height }));
+
+        this.setStatus("done",
+          previewOnly ? "Проверка завершена" : "План импорта готов",
+          summaryText(summary), 100, { summary, rows: previewRows, force: true });
+
+        if (previewOnly) return;
+
+        await this.beginBusy("Создаю Scenes...");
+        const result = await importPlan(plan, o, progress => {
+          const percent = progress.total ? Math.round(progress.done / progress.total * 100) : null;
+          this.setStatus("busy", "Создаю карты...",
+            `Scenes: ${progress.done}/${progress.total}`, percent);
+        });
+
+        this.setStatus("done", "Импорт завершён", result.notification, 100,
+          { summary: result.summary, rows: previewRows, force: true });
+        ui.notifications.info(result.notification);
+        refreshScenesSidebar();
+      } catch (err) {
+        console.error("DMI: ошибка импорта", err);
+        this.setStatus("error", "Ошибка импорта",
+          err?.message || String(err), null, { force: true });
+      } finally {
+        await this.endBusy();
+      }
+    }
+
+    async prepareDelete() {
+      await this.saveCurrentOptions();
+      this.deletePlan = buildDeletePlan(this.optionsState);
+      if (!this.deletePlan.folders.length && !this.deletePlan.scenes.length) {
+        this.deletePlan = null;
+        this.setStatus("done", "Нечего удалять",
+          "Импортированные карты не найдены.", null, { force: true });
+        return;
+      }
+      this._refresh();
+    }
+
+    async confirmDelete() {
+      if (!this.deletePlan) return;
+      await this.beginBusy("Удаляю импортированные Scenes...");
+      try {
+        const sceneIds = this.deletePlan.scenes.map(s => s.id);
+        const folderIds = sortFoldersDeepestFirst(this.deletePlan.folders).map(f => f.id);
+        if (sceneIds.length) await Scene.deleteDocuments(sceneIds);
+        if (folderIds.length) await Folder.deleteDocuments(folderIds);
+        this.deletePlan = null;
+        this.setStatus("done", "Удаление завершено",
+          `Удалено Scenes: ${sceneIds.length}; папок: ${folderIds.length}.`,
+          100, { force: true });
+        refreshScenesSidebar();
+      } catch (err) {
+        console.error("DMI: ошибка удаления", err);
+        this.setStatus("error", "Ошибка удаления",
+          err?.message || String(err), null, { force: true });
+      } finally {
+        await this.endBusy();
+      }
+    }
+
+    async browseFolder() {
+      const o = this.readOptions();
+      new FilePickerImpl({
+        type: "folder", source: o.source, activeSource: o.source, current: o.root,
+        callback: async path => {
+          this.optionsState = { ...o, root: normalizePath(path) };
+          await game.user.setFlag("world", CONFIG_KEY, this.optionsState);
+          this._refresh();
+        }
+      }).render(true);
+    }
+  }
+
+
+
+  function refreshScenesSidebar() {
+    // В V13 сайдбар — ApplicationV2, метода activateTab у него больше нет,
+    // остался только changeTab(tab, group). Каждый шаг — в своём try/catch,
+    // чтобы падение одного не отменяло остальные.
+    try { ui.sidebar?.changeTab?.("scenes", "primary"); }
+    catch (e) { console.warn("DMI: changeTab failed", e); }
+
+    try { ui.scenes?.render?.(true); }
+    catch (e) { console.warn("DMI: scenes render failed", e); }
+
+    setTimeout(() => {
+      try { ui.scenes?.render?.(true); } catch (e) {}
+    }, 150);
+
+    console.log("DMI: сайдбар Scenes обновлён, сцен в мире:", game.scenes.size);
+  }
+
+ 
+
+  const existing = Object.values(ui.windows ?? {}).find(w => w.id === "dnd-map-importer");
+  if (existing) { try { await existing.close(); } catch (e) {} }
+  new DNDMapImporterApp().render(true);
+
+  
+
+  function readZipEntries(buffer) {
+    const view = new DataView(buffer);
+    const size = buffer.byteLength;
+    if (size < 22) throw new Error("Файл слишком мал для ZIP.");
+    let eocd = -1;
+    const searchLimit = Math.max(0, size - 22 - 65535);
+    for (let i = size - 22; i >= searchLimit; i--) {
+      if (view.getUint32(i, true) === 0x06054b50) { eocd = i; break; }
+    }
+    if (eocd < 0) throw new Error("Не найден каталог ZIP.");
+    const count = view.getUint16(eocd + 10, true);
+    let offset = view.getUint32(eocd + 16, true);
+    if (offset === 0xFFFFFFFF || count === 0xFFFF) throw new Error("ZIP64 не поддерживается.");
+    const utf8 = new TextDecoder("utf-8");
+    const utf8Strict = new TextDecoder("utf-8", { fatal: true });
+    let oem; try { oem = new TextDecoder("ibm866"); } catch { oem = utf8; }
+    const decodeName = (b, u) => {
+      if (u) return utf8.decode(b);
+      try { return utf8Strict.decode(b); } catch { return oem.decode(b); }
+    };
+    const entries = [];
+    for (let i = 0; i < count; i++) {
+      if (view.getUint32(offset, true) !== 0x02014b50) throw new Error("Повреждён каталог ZIP.");
+      const flags = view.getUint16(offset + 8, true);
+      const method = view.getUint16(offset + 10, true);
+      const compSize = view.getUint32(offset + 20, true);
+      const uncompSize = view.getUint32(offset + 24, true);
+      const nameLen = view.getUint16(offset + 28, true);
+      const extraLen = view.getUint16(offset + 30, true);
+      const commentLen = view.getUint16(offset + 32, true);
+      const localOffset = view.getUint32(offset + 42, true);
+      if (compSize === 0xFFFFFFFF || localOffset === 0xFFFFFFFF) throw new Error("ZIP64 не поддерживается.");
+      const nameBytes = new Uint8Array(buffer, offset + 46, nameLen);
+      const name = decodeName(nameBytes, Boolean(flags & 0x800)).replace(/\\/g, "/");
+      entries.push({ name, method, compressedSize: compSize, uncompressedSize: uncompSize,
+                     localOffset, isDirectory: name.endsWith("/") });
+      offset += 46 + nameLen + extraLen + commentLen;
+    }
+    return entries;
+  }
+
+  async function extractZipEntry(buffer, entry) {
+    const view = new DataView(buffer);
+    const local = entry.localOffset;
+    if (view.getUint32(local, true) !== 0x04034b50) throw new Error(`Повреждена запись: ${entry.name}`);
+    const nameLen = view.getUint16(local + 26, true);
+    const extraLen = view.getUint16(local + 28, true);
+    const start = local + 30 + nameLen + extraLen;
+    const data = buffer.slice(start, start + entry.compressedSize);
+    if (entry.method === 0) return new Uint8Array(data);
+    if (entry.method === 8) {
+      const stream = new Blob([data]).stream().pipeThrough(new DecompressionStream("deflate-raw"));
+      return new Uint8Array(await new Response(stream).arrayBuffer());
+    }
+    throw new Error(`Метод сжатия ${entry.method} не поддерживается.`);
+  }
+
+  function pickLocalFile(accept) {
+    return new Promise(resolve => {
+      const input = document.createElement("input");
+      input.type = "file";
+      input.accept = accept;
+      input.style.position = "fixed";
+      input.style.left = "-9999px";
+      document.body.appendChild(input);
+      let settled = false;
+      const finish = (r) => {
+        if (settled) return; settled = true;
+        try { input.remove(); } catch (_) {}
+        resolve(r);
+      };
+      input.addEventListener("change", () => {
+        const file = input.files?.[0];
+        if (!file) return finish(null);
+        const reader = new FileReader();
+        reader.onload = () => finish({ name: file.name, size: file.size, buffer: reader.result });
+        reader.onerror = () => { console.error("DMI: FileReader error", reader.error);
+                                  finish({ name: file.name, buffer: null, error: reader.error }); };
+        reader.readAsArrayBuffer(file);
+      }, { once: true });
+      input.addEventListener("cancel", () => finish(null), { once: true });
+      input.click();
+    });
+  }
+
+  async function ensureDirectory(source, path, createdDirs) {
+    const segments = normalizePath(path).split("/").filter(Boolean);
+    let current = "";
+    for (const segment of segments) {
+      current = current ? `${current}/${segment}` : segment;
+      if (createdDirs.has(current)) continue;
+      try { await FilePickerImpl.createDirectory(source, current); }
+      catch (err) {
+        const msg = String(err?.message ?? err);
+        if (!/EEXIST|already exists|существует/i.test(msg)) throw err;
+      }
+      createdDirs.add(current);
+    }
+  }
+
+  async function collectImageFiles(options, onProgress) {
+    const pending = [options.root];
+    const found = [];
+    const seenDirs = new Set();
+    const seenFiles = new Set();
+    while (pending.length) {
+      const target = pending.shift();
+      const key = normalizePath(target);
+      if (!key || seenDirs.has(key)) continue;
+      seenDirs.add(key);
+      const result = await safeBrowse(options.source, target);
+      if (!result.ok) continue;
+      if (options.recursive) {
+        for (const dir of result.data.dirs ?? []) {
+          const n = normalizePath(dir);
+          if (!seenDirs.has(n)) pending.push(dir);
+        }
+      }
+      for (const file of result.data.files ?? []) {
+        const n = normalizePath(file);
+        if (!isImagePath(n) || seenFiles.has(n)) continue;
+        seenFiles.add(n);
+        found.push({ path: file, normalizedPath: n });
+      }
+      onProgress?.({ dirs: seenDirs.size, files: found.length });
+      await sleep(0);
+    }
+    return { files: found.sort((a, b) =>
+      a.normalizedPath.localeCompare(b.normalizedPath, undefined, { sensitivity: "base" })) };
+  }
+
+  async function buildImportPlan(options, files) {
+    const plan = [];
+    for (const record of files) {
+      const relative = relativeToRoot(options.root, record.normalizedPath);
+      const parts = relative.split("/").filter(Boolean);
+      const fileName = parts.pop();
+      const dirKey = parts.join("/");
+      const folderSegments = getFolderSegments(options, dirKey);
+      const sceneName = cleanName(stripExtension(fileName)) || "Карта";
+      const existingFolder = findFolderBySegments(folderSegments, null);
+      const existingScene = options.skipDuplicates
+        ? findSceneInFolder(sceneName, existingFolder?.id ?? null) : null;
+      const dims = await getImageDimensions(record.path);
+      plan.push({
+        sourcePath: record.path,
+        sceneName, folderSegments,
+        targetPath: [...folderSegments, sceneName].join(" / "),
+        width: dims.width, height: dims.height,
+        existingScene, duplicate: Boolean(existingScene)
+      });
+    }
+    return plan;
+  }
+
+
+  async function importPlan(plan, options, onProgress) {
+    let createdFolders = 0, createdScenes = 0, duplicates = 0, done = 0;
+    let lastCreatedScene = null;
+
+    for (const entry of plan) {
+      if (entry.duplicate && options.skipDuplicates) {
+        duplicates++; done++; onProgress?.({ done, total: plan.length }); continue;
+      }
+
+      // 1. Папка (её ID)
+      const folderResult = await getOrCreateFolderBySegments(entry.folderSegments, null);
+      createdFolders += folderResult.created;
+      const folder = folderResult.folder;
+      const folderId = folder ? (folder.id ?? folder._id ?? null) : null;
+
+      if (folder) {
+        console.log(`DMI: папка для "${entry.sceneName}" = "${folder.name}" (id=${folderId})`);
+      } else {
+        console.warn(`DMI: для "${entry.sceneName}" папка НЕ найдена`);
+      }
+
+      // 2. Проверка дубликата
+      const existing = options.skipDuplicates
+        ? findSceneInFolder(entry.sceneName, folderId) : null;
+      if (existing) {
+        duplicates++; done++; onProgress?.({ done, total: plan.length });
+        continue;
+      }
+
+      // 3. Создание сцены БЕЗ folder
+      const sceneData = {
+        name: entry.sceneName,
+        width: entry.width,
+        height: entry.height,
+        background: {
+          src: entry.sourcePath,
+          offsetX: 0, offsetY: 0, scaleX: 1, scaleY: 1
+        },
+        grid: {
+          size: options.gridSize,
+          distance: options.gridDistance,
+          units: options.gridUnits
+        },
+        navigation: { show: true }
+      };
+
+      let scene = await Scene.create(sceneData);
+      if (Array.isArray(scene)) scene = scene[0];
+
+      if (!scene) {
+        console.error(`DMI: Scene.create вернул пусто для "${entry.sceneName}"`);
+      }
+
+      // 4. ЯВНО присваиваем папку через update
+      if (scene && folderId) {
+        try {
+          await scene.update({ folder: folderId }, { diff: false, recursive: false });
+          console.log(`DMI: "${scene.name}" → folder=${folderId}`);
+        } catch (err) {
+          console.error(`DMI: не удалось присвоить folder для "${scene.name}"`, err);
+        }
+      }
+
+      if (scene) createdScenes++;
+      lastCreatedScene = scene;
+      done++;
+      onProgress?.({ done, total: plan.length });
+      await sleep(0);
+    }
+
+    if (options.activateAfterImport && lastCreatedScene) {
+      try { await lastCreatedScene.activate(); } catch (e) {}
+    }
+
+    return {
+      summary: {
+        folders: new Set(plan.flatMap(e =>
+          e.folderSegments.map((_, i) => e.folderSegments.slice(0, i + 1).join("/")))).size,
+        scenes: createdScenes, images: plan.length, duplicates
+      },
+      notification: `Импортировано карт: ${createdScenes}; дубликатов: ${duplicates}; создано папок: ${createdFolders}.`
+    };
+  }
+
+  function summarizePlan(plan) {
+    const folders = new Set();
+    let duplicates = 0;
+    for (const entry of plan) {
+      entry.folderSegments.forEach((_, i) =>
+        folders.add(entry.folderSegments.slice(0, i + 1).join("/")));
+      if (entry.duplicate) duplicates++;
+    }
+    return { folders: folders.size, scenes: plan.length - duplicates, images: plan.length, duplicates };
+  }
+
+  function summaryText(s) {
+    return `Найдено карт: ${s.images}; новых Scenes: ${s.scenes}; дубликатов: ${s.duplicates}; папок: ${s.folders}.`;
+  }
+
+  async function getImageDimensions(path) {
+    try {
+      const response = await fetch(encodeURI(path));
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const blob = await response.blob();
+      const bitmap = await createImageBitmap(blob);
+      const result = { width: bitmap.width, height: bitmap.height };
+      bitmap.close();
+      return result;
+    } catch (err) {
+      console.warn(`DMI: размер ${path} не определён`, err);
+      return { width: 2000, height: 2000 };
+    }
+  }
+
+
+
+  async function getOrCreateFolderBySegments(segments, baseParentId = null) {
+    let parentId = baseParentId || null;
+    let folder = null;
+    let created = 0;
+    for (const name of segments) {
+      folder = findFolder(name, parentId);
+      if (!folder) {
+        let fd = await Folder.create({ name, type: "Scene", folder: parentId });
+        folder = Array.isArray(fd) ? fd[0] : fd;
+        created++;
+        console.log(`DMI: создана папка "${name}" id=${folder?.id} parent=${parentId}`);
+      }
+      parentId = folder ? (folder.id ?? folder._id ?? null) : null;
+    }
+    return { folder, created };
+  }
+
+  function findFolderBySegments(segments, baseParentId = null) {
+    let parentId = baseParentId || null, folder = null;
+    for (const name of segments) {
+      folder = findFolder(name, parentId);
+      if (!folder) return null;
+      parentId = folder.id ?? folder._id ?? null;
+    }
+    return folder;
+  }
+
+  function findFolder(name, parentId) {
+    const expected = parentId || null;
+    return game.folders.find(f =>
+      f.type === "Scene" &&
+      f.name === name &&
+      (getParentFolderId(f) ?? null) === expected
+    );
+  }
+
+  function findSceneInFolder(name, folderId) {
+    const expected = folderId || null;
+    return game.scenes.find(s =>
+      s.name === name &&
+      (getDocumentFolderId(s) ?? null) === expected
+    );
+  }
+
+  function buildDeletePlan(options) {
+    const rootName = cleanName(lastPathPart(options.root) || DEFAULT_SUBFOLDER);
+    const rootFolders = game.folders.filter(f => f.type === "Scene" && f.name === rootName);
+    const folderIds = new Set();
+    for (const folder of rootFolders) {
+      folderIds.add(folder.id);
+      for (const child of getDescendantFolders(folder.id)) folderIds.add(child.id);
+    }
+    const folders = game.folders.filter(f => folderIds.has(f.id));
+    const scenes = game.scenes.filter(s => {
+      const fid = getDocumentFolderId(s);
+      if (fid && folderIds.has(fid)) return true;
+      return LEGACY_PREFIXES.some(p => s.name.startsWith(p));
+    });
+    return { folders, scenes };
+  }
+
+  function getDescendantFolders(parentId) {
+    const out = [], pending = [parentId];
+    while (pending.length) {
+      const cur = pending.shift();
+      const children = game.folders.filter(f =>
+        f.type === "Scene" && (getParentFolderId(f) ?? null) === cur);
+      out.push(...children);
+      pending.push(...children.map(c => c.id));
+    }
+    return out;
+  }
+
+  function sortFoldersDeepestFirst(folders) {
+    return [...folders].sort((a, b) => getFolderDepth(b) - getFolderDepth(a));
+  }
+
+  function getFolderDepth(folder) {
+    let depth = 0, cur = folder;
+    while (cur) {
+      depth++;
+      const pid = getParentFolderId(cur);
+      cur = pid ? game.folders.get(pid) : null;
+    }
+    return depth;
+  }
+
+  function getParentFolderId(folder) {
+    const p = folder?.folder ?? folder?.parent ??
+              folder?._source?.folder ?? folder?._source?.parent ?? null;
+    return typeof p === "string" ? p : p?.id ?? p?._id ?? null;
+  }
+
+  function getDocumentFolderId(doc) {
+    const f = doc?.folder ?? doc?._source?.folder ?? null;
+    return typeof f === "string" ? f : f?.id ?? f?._id ?? null;
+  }
+
+  function getFolderSegments(options, dirKey) {
+    const segments = [];
+    if (options.createRootFolder) {
+      segments.push(cleanName(lastPathPart(options.root) || DEFAULT_SUBFOLDER));
+    }
+    for (const part of dirKey.split("/").filter(Boolean)) segments.push(cleanName(part));
+    return segments;
+  }
+
+  function relativeToRoot(root, path) {
+    const nr = normalizePath(root), np = normalizePath(path);
+    if (np === nr) return "";
+    if (np.startsWith(`${nr}/`)) return np.slice(nr.length + 1);
+    return np;
+  }
+
+  async function safeBrowse(source, target) {
+    let lastError = null;
+    const decoded = normalizePath(target);
+    const encoded = encodeFoundryPath(decoded);
+    for (const candidate of [...new Set([decoded, encoded])]) {
+      try {
+        const data = await FilePickerImpl.browse(source, candidate);
+        return { ok: true, data };
+      } catch (err) { lastError = err; }
+    }
+    return { ok: false, error: lastError };
+  }
+
+  function getAvailableSources() {
+    const sources = ["data", "public"];
+    if (game.data?.files?.s3) sources.push("s3");
+    return sources;
+  }
+
+  function sourceLabel(source) {
+    return { data: "Data", public: "Public", s3: "S3" }[source] ?? source;
+  }
+
+  function isImagePath(path) {
+    const m = path.toLowerCase().match(/\.[^./?#]+(?=([?#].*)?$)/);
+    return Boolean(m && IMAGE_EXT.has(m[0]));
+  }
+
+  function normalizePath(value) {
+    let path = decodePath(String(value ?? "").trim()).replace(/\\/g, "/");
+    const dataMatch = path.match(/FoundryVTT\/Data\/(.+)$/i) ?? path.match(/\/Data\/(.+)$/i);
+    if (dataMatch) path = dataMatch[1];
+    return path.replace(/^(data|public|s3):/i, "").replace(/^\/+/, "")
+               .replace(/^Data\//i, "").replace(/\/+$/, "");
+  }
+
+  function encodeFoundryPath(value) {
+    return normalizePath(value).split("/").map(encodeURIComponent).join("/");
+  }
+
+  function decodePath(value) {
+    try { return decodeURI(value); } catch { return value; }
+  }
+
+  function sanitizeFsName(value) {
+    return String(value ?? "").replace(/[<>:"|?*\u0000-\u001f]/g, "").replace(/^\.+$/, "").trim();
+  }
+
+  function cleanName(value) {
+    return String(value ?? "").replace(/[_-]+/g, " ").replace(/\s+/g, " ").trim();
+  }
+
+  function stripExtension(path) { return path.replace(/\.[^/.]+$/, ""); }
+
+  function lastPathPart(path) {
+    const parts = normalizePath(path).split("/").filter(Boolean);
+    return parts[parts.length - 1];
+  }
+
+  function clamp(value, min, max) {
+    if (!Number.isFinite(value)) return min;
+    return Math.min(max, Math.max(min, value));
+  }
+
+  function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+  function escapeHtml(value) {
+    return String(value ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  }
+
+  function loadOptions() {
+    const saved = game.user.getFlag("world", CONFIG_KEY) ?? {};
+    const options = { ...DEFAULT_OPTIONS, ...saved };
+    if (saved.createRootFolder === true) {
+      options.createRootFolder = false;
+      game.user.setFlag("world", CONFIG_KEY, options);
+    }
+    options.root = normalizePath(options.root);
+    return options;
+  }
+
+})().catch(err => {
+  console.error("DMI: фатальная ошибка", err);
+  ui.notifications.error("DMI: ошибка. Смотри консоль (F12).");
+});
